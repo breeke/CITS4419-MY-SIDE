@@ -1,7 +1,17 @@
+import hashlib
+import hmac
 import ipaddress
 import os
 import random
 import struct
+
+# AES comes from the 'cryptography' package (pip install cryptography).
+# HMAC and SHA-256 come from Python's standard library (hmac, hashlib)
+try:
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    raise SystemExit("This simulator needs the 'cryptography' package: pip install cryptography")
 
 DATA = 1
 ACK = 2
@@ -20,6 +30,7 @@ BROADCAST_MAC = "FF:FF:FF:FF"
 # ---------------------------------------------------------------------------
 # Next Header values: tell the receiver which protocol is inside the IPv6 payload
 NEXT_HEADER_UDP = 17        # payload is a UDP datagram (Part C)
+NEXT_HEADER_ESP = 50        # payload is an IPsec ESP packet (Part D)
 NEXT_HEADER_ICMPV6 = 58     # payload is an ICMPv6 message (carries RPL)
 NEXT_HEADER_NONE = 59       # nothing follows the IPv6 header
 
@@ -98,6 +109,40 @@ COAP_PAYLOAD_MARKER = 0xFF  # separates options from the payload
 SERVER_MAC = "00:00:01:02"
 SERVER_IPV6 = "2001:db8::1"
 
+# ---------------------------------------------------------------------------
+# Security constants (Part D)
+# ---------------------------------------------------------------------------
+# No key exchange is simulated: every node and the server are preconfigured
+# with the same keys, as if IKE (IPsec) and the DTLS handshake already ran.
+# AES-128 needs a 16-byte key; HMAC keys can be any length
+IPSEC_ENC_KEY = b"IPSEC-ENC-KEY-01"     # 16 bytes
+IPSEC_HMAC_KEY = b"IPSEC-HMAC-KEY1"     # 15 bytes
+DTLS_ENC_KEY = b"0123456789ABCDEF"      # 16 bytes
+DTLS_HMAC_KEY = b"ABCDEF0123456789"     # 16 bytes
+
+# IPsec ESP (Transport Mode):
+#   SPI (4) | Sequence Number (4) | IV (16) | Encrypted Payload | HMAC (32)
+# The encrypted payload is the UDP datagram followed by the ESP Next Header
+# byte (the ESP trailer), so the Next Header is also hidden from eavesdroppers
+IPSEC_SPI = 0x00000001
+ESP_HEADER_FORMAT = "!II"       # SPI, Sequence Number
+ESP_HEADER_LEN = struct.calcsize(ESP_HEADER_FORMAT)     # 8 bytes
+IV_LEN = 16                     # AES block size
+HMAC_LEN = 32                   # full HMAC-SHA-256 output
+
+# DTLS record (simplified, DTLS 1.2 field layout):
+#   Type (1) | Version (2) | Epoch (2) | Sequence Number (6) | Length (2) | Protected Data
+# Protected Data = IV (16) | AES-128-CBC ciphertext of the CoAP message | HMAC (32)
+DTLS_HEADER_FORMAT = "!BHH6sH"
+DTLS_HEADER_LEN = struct.calcsize(DTLS_HEADER_FORMAT)   # 13 bytes
+DTLS_TYPE_APPLICATION_DATA = 23     # record carries application data (CoAP)
+DTLS_VERSION_1_2 = 0xFEFD           # DTLS 1.2 on the wire
+DTLS_EPOCH = 1                      # epoch 0 = handshake; 1 = after the keys are in use
+
+# CoAP over DTLS uses its own well-known port ("coaps"), so the server can
+# tell secured traffic (5684) apart from plain CoAP (5683)
+COAPS_SERVER_PORT = 5684
+
 
 def format_rank(rank):
     return "infinity" if rank == INFINITE_RANK else str(rank)
@@ -129,6 +174,33 @@ def udp_checksum(source_ipv6, destination_ipv6, udp_datagram):
         + struct.pack("!I3xB", len(udp_datagram), NEXT_HEADER_UDP)
     )
     return internet_checksum(pseudo_header + udp_datagram)
+
+
+def aes_cbc_encrypt(key, plaintext):
+    """
+    AES-128-CBC encryption. AES works on 16-byte blocks, so the plaintext is
+    padded (PKCS7) to a multiple of 16. A fresh random IV makes the same
+    plaintext encrypt to a different ciphertext every time.
+    Returns (iv, ciphertext).
+    """
+    iv = os.urandom(IV_LEN)
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    return iv, encryptor.update(padded) + encryptor.finalize()
+
+
+def aes_cbc_decrypt(key, iv, ciphertext):
+    """Reverse of aes_cbc_encrypt: decrypt, then remove the PKCS7 padding."""
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+def hmac_sha256(key, data):
+    """32-byte HMAC-SHA-256 tag: only someone with the key can produce it."""
+    return hmac.new(key, data, hashlib.sha256).digest()
 
 
 def encode_option_nibble(value):
@@ -250,6 +322,31 @@ class Node:
         self.coap_message_id = random.randint(0, 0xFFFF)
         # Outstanding CON requests waiting for their ACK: {Message ID: Token}
         self.pending_requests = {}
+
+        # Security state (Part D), one entry per peer we talk to securely.
+        # IPsec SA: SPI, our outgoing ESP sequence number, and the sequence
+        # numbers already accepted from that peer (replay protection)
+        self.ipsec_sas = {}
+        # DTLS session: epoch, our outgoing record sequence number, and the
+        # record sequence numbers already accepted from that peer
+        self.dtls_sessions = {}
+
+        # Copy of the last packet sent over the wired link, used to stage the
+        # replay and tampering tests in Part D (an attacker on that link)
+        self.last_wired_packet = None
+
+    def get_ipsec_sa(self, peer_ipv6):
+        # The SA is assumed to be already established (no IKE), so it is
+        # created with its initial values the first time it is needed
+        return self.ipsec_sas.setdefault(
+            peer_ipv6, {"spi": IPSEC_SPI, "seq_out": 0, "accepted": set()}
+        )
+
+    def get_dtls_session(self, peer_ipv6):
+        # Handshake assumed complete: epoch 1, record sequence numbers from 0
+        return self.dtls_sessions.setdefault(
+            peer_ipv6, {"epoch": DTLS_EPOCH, "seq_out": 0, "accepted": set()}
+        )
 
     def setup(self):
         print(f"[{self.label}]")
@@ -407,6 +504,7 @@ class Node:
             f"Source MAC={self.mac_address}, Destination MAC={peer.mac_address}, "
             f"Payload Length={len(packet)}"
         )
+        self.last_wired_packet = packet
         peer.receive_wired(frame)
 
     def receive_wired(self, frame):
@@ -531,6 +629,13 @@ class Node:
                 f"[{self.label}][IPv6] Not the final destination, forwarding packet "
                 f"(IPv6 Source={source_ipv6} and Destination={destination_ipv6} unchanged)"
             )
+            if next_header == NEXT_HEADER_ESP:
+                # Transport Mode leaves the IPv6 header readable so routers can
+                # forward, but they cannot read or alter the protected payload
+                print(
+                    f"[{self.label}][IPv6] Payload is ESP-encrypted: forwarding "
+                    f"without being able to read the UDP/DTLS/CoAP inside"
+                )
             self.route_ipv6(packet, destination_ipv6)
             return
 
@@ -541,6 +646,9 @@ class Node:
         elif next_header == NEXT_HEADER_UDP:
             print(f"[{self.label}][IPv6] Passing UDP datagram to UDP layer")
             self.receive_udp(payload, source_ipv6, destination_ipv6)
+        elif next_header == NEXT_HEADER_ESP:
+            print(f"[{self.label}][IPv6] Next Header=50, passing ESP packet to IPsec")
+            self.receive_ipsec(payload, source_ipv6, destination_ipv6)
         elif next_header == NEXT_HEADER_NONE:
             print(f"[{self.label}][IPv6] No Next Header, nothing to deliver")
         else:
@@ -624,7 +732,8 @@ class Node:
     - Length (2 bytes): UDP header + UDP payload
     - Checksum (2 bytes)
     """
-    def send_udp(self, payload, destination_ipv6, source_port, destination_port):
+    def send_udp(self, payload, destination_ipv6, source_port, destination_port,
+                 protect_with_esp=False):
         length = UDP_HEADER_LEN + len(payload)
 
         # Checksum is calculated with the checksum field set to 0, then
@@ -643,7 +752,11 @@ class Node:
             f"Destination Port={destination_port}, Length={length}, "
             f"Checksum=0x{checksum:04x}"
         )
-        self.send_ipv6(datagram, destination_ipv6, NEXT_HEADER_UDP)
+        if protect_with_esp:
+            # Part D: the whole UDP datagram (header + DTLS record) goes into ESP
+            self.send_ipsec(datagram, destination_ipv6)
+        else:
+            self.send_ipv6(datagram, destination_ipv6, NEXT_HEADER_UDP)
 
     def receive_udp(self, datagram, source_ipv6, destination_ipv6):
         if len(datagram) < UDP_HEADER_LEN:
@@ -672,18 +785,245 @@ class Node:
             return
         print(f"[{self.label}][UDP] Checksum verified")
 
-        # Demultiplex using the destination port
-        if destination_port in self.udp_listening_ports:
+        # Demultiplex using the ports
+        if destination_port not in self.udp_listening_ports:
+            print(
+                f"[{self.label}][UDP] No service listening on port "
+                f"{destination_port}, dropping"
+            )
+        elif COAPS_SERVER_PORT in (source_port, destination_port):
+            # Traffic to or from the coaps port carries a DTLS record
+            print(
+                f"[{self.label}][UDP] Port {COAPS_SERVER_PORT} is CoAP over DTLS, "
+                f"passing payload to DTLS"
+            )
+            self.receive_dtls(payload, source_ipv6, source_port)
+        else:
             print(
                 f"[{self.label}][UDP] Port {destination_port} is the CoAP service, "
                 f"passing payload to CoAP"
             )
             self.receive_coap(payload, source_ipv6, source_port)
-        else:
+
+
+    """
+    IPsec ESP layer, Transport Mode (Part D)
+    - SPI (4 bytes)
+    - Sequence Number (4 bytes)
+    - IV (16 bytes)
+    - Encrypted Payload: AES-128-CBC of [UDP datagram | ESP Next Header (1 byte)]
+    - HMAC-SHA-256 (32 bytes) over SPI | Sequence Number | IV | Encrypted Payload
+    The IPv6 header stays in the clear so the packet can still be routed.
+    """
+    def send_ipsec(self, datagram, destination_ipv6):
+        sa = self.get_ipsec_sa(destination_ipv6)
+        sa["seq_out"] += 1          # starts at 1, +1 for every new ESP packet
+        sequence = sa["seq_out"]
+
+        print(
+            f"[{self.label}][IPsec] Protecting UDP datagram with ESP Transport Mode: "
+            f"SPI=0x{sa['spi']:08x}, Sequence Number={sequence}"
+        )
+
+        # The ESP Next Header (17 = UDP) is appended to the payload and
+        # encrypted with it, so the receiver learns what is inside only
+        # after decryption
+        plaintext = datagram + bytes([NEXT_HEADER_UDP])
+        print(
+            f"[{self.label}][IPsec] Plaintext (UDP datagram + ESP Next Header=17), "
+            f"{len(plaintext)} bytes: {plaintext.hex()}"
+        )
+
+        iv, ciphertext = aes_cbc_encrypt(IPSEC_ENC_KEY, plaintext)
+        print(f"[{self.label}][IPsec] IV: {iv.hex()}")
+        print(
+            f"[{self.label}][IPsec] Ciphertext (AES-128-CBC), "
+            f"{len(ciphertext)} bytes: {ciphertext.hex()}"
+        )
+
+        # Encrypt-then-MAC: the HMAC covers the header fields and the
+        # ciphertext, so changing any of them is detected
+        header = struct.pack(ESP_HEADER_FORMAT, sa["spi"], sequence)
+        tag = hmac_sha256(IPSEC_HMAC_KEY, header + iv + ciphertext)
+        print(f"[{self.label}][IPsec] HMAC-SHA-256 (SPI|Seq|IV|Ciphertext): {tag.hex()}")
+
+        esp_packet = header + iv + ciphertext + tag
+        print(
+            f"[{self.label}][IPsec] ESP packet built: {ESP_HEADER_LEN} + {IV_LEN} + "
+            f"{len(ciphertext)} + {HMAC_LEN} = {len(esp_packet)} bytes, "
+            f"passing to IPv6 with Next Header=50"
+        )
+        self.send_ipv6(esp_packet, destination_ipv6, NEXT_HEADER_ESP)
+
+    def receive_ipsec(self, esp_packet, source_ipv6, destination_ipv6):
+        if len(esp_packet) < ESP_HEADER_LEN + IV_LEN + 16 + HMAC_LEN:
+            print(f"[{self.label}][IPsec] ESP packet too short, dropping")
+            return
+
+        spi, sequence = struct.unpack(ESP_HEADER_FORMAT, esp_packet[:ESP_HEADER_LEN])
+        iv = esp_packet[ESP_HEADER_LEN:ESP_HEADER_LEN + IV_LEN]
+        ciphertext = esp_packet[ESP_HEADER_LEN + IV_LEN:-HMAC_LEN]
+        received_tag = esp_packet[-HMAC_LEN:]
+
+        print(
+            f"[{self.label}][IPsec] Received ESP packet: SPI=0x{spi:08x}, "
+            f"Sequence Number={sequence}, {len(esp_packet)} bytes"
+        )
+
+        # The SPI tells the receiver which SA (keys, sequence state) to use
+        sa = self.get_ipsec_sa(source_ipv6)
+        if spi != sa["spi"]:
+            print(f"[{self.label}][IPsec] Unknown SPI 0x{spi:08x}, dropping")
+            return
+
+        print(f"[{self.label}][IPsec] Received ciphertext, {len(ciphertext)} bytes: {ciphertext.hex()}")
+
+        # 1. Integrity: recompute the HMAC and compare in constant time.
+        #    Checked before decrypting, so forged packets are never processed
+        expected_tag = hmac_sha256(IPSEC_HMAC_KEY, esp_packet[:ESP_HEADER_LEN] + iv + ciphertext)
+        print(f"[{self.label}][IPsec] Received HMAC: {received_tag.hex()}")
+        print(f"[{self.label}][IPsec] Computed HMAC: {expected_tag.hex()}")
+        if not hmac.compare_digest(received_tag, expected_tag):
             print(
-                f"[{self.label}][UDP] No service listening on port "
-                f"{destination_port}, dropping"
+                f"[{self.label}][IPsec] HMAC verification FAILED: packet was modified "
+                f"or not sent by the SA peer, dropping"
             )
+            return
+        print(f"[{self.label}][IPsec] HMAC verified: integrity and authenticity OK")
+
+        # 2. Replay protection: a sequence number may only be accepted once
+        if sequence in sa["accepted"]:
+            print(
+                f"[{self.label}][IPsec] REPLAY DETECTED: Sequence Number={sequence} "
+                f"was already accepted, dropping"
+            )
+            return
+        sa["accepted"].add(sequence)
+        print(
+            f"[{self.label}][IPsec] Replay check passed: Sequence Number={sequence} is new "
+            f"(accepted so far: {sorted(sa['accepted'])})"
+        )
+
+        # 3. Confidentiality: decrypt and read the ESP Next Header
+        plaintext = aes_cbc_decrypt(IPSEC_ENC_KEY, iv, ciphertext)
+        datagram, esp_next_header = plaintext[:-1], plaintext[-1]
+        print(
+            f"[{self.label}][IPsec] Decrypted plaintext, {len(plaintext)} bytes: "
+            f"{plaintext.hex()}"
+        )
+
+        if esp_next_header != NEXT_HEADER_UDP:
+            print(f"[{self.label}][IPsec] ESP Next Header={esp_next_header} not supported, dropping")
+            return
+        print(f"[{self.label}][IPsec] ESP Next Header=17, passing UDP datagram to UDP")
+        self.receive_udp(datagram, source_ipv6, destination_ipv6)
+
+
+    """
+    DTLS record layer (Part D)
+    - Type (1 byte) (23 = application data)
+    - Version (2 bytes) (0xFEFD = DTLS 1.2)
+    - Epoch (2 bytes)
+    - Sequence Number (6 bytes)
+    - Length (2 bytes): length of the protected data
+    - Protected Data: IV (16) | AES-128-CBC ciphertext of the CoAP message | HMAC (32)
+    """
+    def send_dtls(self, message, destination_ipv6, source_port, destination_port):
+        session = self.get_dtls_session(destination_ipv6)
+        sequence = session["seq_out"]
+        session["seq_out"] += 1     # DTLS record sequence numbers start at 0 in each epoch
+
+        print(
+            f"[{self.label}][DTLS] Protecting CoAP message: Type=23 (application data), "
+            f"Version=0x{DTLS_VERSION_1_2:04x}, Epoch={session['epoch']}, "
+            f"Sequence Number={sequence}"
+        )
+        print(f"[{self.label}][DTLS] Plaintext (CoAP message), {len(message)} bytes: {message.hex()}")
+
+        iv, ciphertext = aes_cbc_encrypt(DTLS_ENC_KEY, message)
+        print(f"[{self.label}][DTLS] IV: {iv.hex()}")
+        print(
+            f"[{self.label}][DTLS] Ciphertext (AES-128-CBC), "
+            f"{len(ciphertext)} bytes: {ciphertext.hex()}"
+        )
+
+        # The HMAC covers type, version, epoch and sequence number as well as
+        # the ciphertext, so a record cannot be replayed under a new number
+        sequence_bytes = sequence.to_bytes(6, "big")
+        mac_input = (
+            struct.pack("!BHH", DTLS_TYPE_APPLICATION_DATA, DTLS_VERSION_1_2, session["epoch"])
+            + sequence_bytes + iv + ciphertext
+        )
+        tag = hmac_sha256(DTLS_HMAC_KEY, mac_input)
+        print(f"[{self.label}][DTLS] HMAC-SHA-256 (header fields|IV|Ciphertext): {tag.hex()}")
+
+        protected = iv + ciphertext + tag
+        record = struct.pack(
+            DTLS_HEADER_FORMAT, DTLS_TYPE_APPLICATION_DATA, DTLS_VERSION_1_2,
+            session["epoch"], sequence_bytes, len(protected)
+        ) + protected
+        print(
+            f"[{self.label}][DTLS] DTLS record built: {DTLS_HEADER_LEN}-byte header + "
+            f"{len(protected)} bytes protected data = {len(record)} bytes, passing to UDP"
+        )
+
+        # DTLS output is carried by UDP, and in Part D that UDP datagram is
+        # then protected again by IPsec ESP
+        self.send_udp(record, destination_ipv6, source_port, destination_port,
+                      protect_with_esp=True)
+
+    def receive_dtls(self, record, source_ipv6, source_port):
+        if len(record) < DTLS_HEADER_LEN + IV_LEN + 16 + HMAC_LEN:
+            print(f"[{self.label}][DTLS] Record too short, dropping")
+            return
+
+        record_type, version, epoch, sequence_bytes, length = struct.unpack(
+            DTLS_HEADER_FORMAT, record[:DTLS_HEADER_LEN]
+        )
+        sequence = int.from_bytes(sequence_bytes, "big")
+        protected = record[DTLS_HEADER_LEN:DTLS_HEADER_LEN + length]
+        iv = protected[:IV_LEN]
+        ciphertext = protected[IV_LEN:-HMAC_LEN]
+        received_tag = protected[-HMAC_LEN:]
+
+        print(
+            f"[{self.label}][DTLS] Parsing DTLS record: Type={record_type}, "
+            f"Version=0x{version:04x}, Epoch={epoch}, Sequence Number={sequence}, "
+            f"Length={length}"
+        )
+
+        session = self.get_dtls_session(source_ipv6)
+        if record_type != DTLS_TYPE_APPLICATION_DATA or epoch != session["epoch"]:
+            print(f"[{self.label}][DTLS] Unexpected record type or epoch, dropping")
+            return
+
+        print(f"[{self.label}][DTLS] Received ciphertext, {len(ciphertext)} bytes: {ciphertext.hex()}")
+
+        # 1. Integrity
+        mac_input = record[:DTLS_HEADER_LEN - 2] + iv + ciphertext     # header without Length
+        expected_tag = hmac_sha256(DTLS_HMAC_KEY, mac_input)
+        print(f"[{self.label}][DTLS] Received HMAC: {received_tag.hex()}")
+        print(f"[{self.label}][DTLS] Computed HMAC: {expected_tag.hex()}")
+        if not hmac.compare_digest(received_tag, expected_tag):
+            print(f"[{self.label}][DTLS] HMAC verification FAILED, dropping record")
+            return
+        print(f"[{self.label}][DTLS] HMAC verified: integrity and authenticity OK")
+
+        # 2. Replay protection (per epoch)
+        if sequence in session["accepted"]:
+            print(
+                f"[{self.label}][DTLS] REPLAY DETECTED: Sequence Number={sequence} "
+                f"was already accepted, dropping"
+            )
+            return
+        session["accepted"].add(sequence)
+        print(f"[{self.label}][DTLS] Replay check passed: Sequence Number={sequence} is new")
+
+        # 3. Decrypt and hand the CoAP message up
+        message = aes_cbc_decrypt(DTLS_ENC_KEY, iv, ciphertext)
+        print(f"[{self.label}][DTLS] Decrypted plaintext (CoAP message), {len(message)} bytes: {message.hex()}")
+        print(f"[{self.label}][DTLS] Passing CoAP message to CoAP")
+        self.receive_coap(message, source_ipv6, source_port, secure=True)
 
 
     """
@@ -696,7 +1036,7 @@ class Node:
     - 0xFF + Payload (variable)
     """
     def send_coap(self, destination_ipv6, source_port, destination_port,
-                  msg_type, code, message_id, token, options, payload):
+                  msg_type, code, message_id, token, options, payload, secure=False):
         message = build_coap_message(msg_type, code, message_id, token, options, payload)
 
         print(
@@ -707,9 +1047,14 @@ class Node:
         )
         print(f"[{self.label}][CoAP] Message bytes ({len(message)}): {message.hex(' ')}")
 
-        self.send_udp(message, destination_ipv6, source_port, destination_port)
+        if secure:
+            # Part D: CoAP -> DTLS -> UDP -> IPsec ESP -> IPv6 -> MAC
+            self.send_dtls(message, destination_ipv6, source_port, destination_port)
+        else:
+            # Part C: CoAP -> UDP -> IPv6 -> MAC
+            self.send_udp(message, destination_ipv6, source_port, destination_port)
 
-    def receive_coap(self, message, source_ipv6, source_port):
+    def receive_coap(self, message, source_ipv6, source_port, secure=False):
         if len(message) < 4:
             print(f"[{self.label}][CoAP] Message too short, dropping")
             return
@@ -726,13 +1071,13 @@ class Node:
 
         # Request codes are class 0 (code < 32); responses are class 2-5
         if coap["code"] != 0 and coap["code"] < 32:
-            self.handle_coap_request(coap, source_ipv6, source_port)
+            self.handle_coap_request(coap, source_ipv6, source_port, secure)
         elif coap["type"] == COAP_ACK:
             self.handle_coap_response(coap)
         else:
             print(f"[{self.label}][CoAP] Unexpected message, ignoring")
 
-    def handle_coap_request(self, coap, source_ipv6, source_port):
+    def handle_coap_request(self, coap, source_ipv6, source_port, secure=False):
         # IoT nodes only act as CoAP clients; the Server class overrides this
         print(f"[{self.label}][CoAP] This node does not host CoAP resources, ignoring request")
 
@@ -767,8 +1112,11 @@ class Node:
         self.coap_message_id = (self.coap_message_id + 1) % 0x10000
         return message_id
 
-    def send_sensor_data(self, server_ipv6):
-        """Application: read a temperature and POST it to the CoAP server."""
+    def send_sensor_data(self, server_ipv6, secure=False):
+        """
+        Application: read a temperature and POST it to the CoAP server.
+        secure=False -> Part C (plain CoAP), secure=True -> Part D (DTLS + IPsec)
+        """
         temperature = round(random.uniform(18.0, 30.0), 1)
         print(f"[{self.label}][App] Generated sensor reading: Temperature={temperature}°C")
 
@@ -783,10 +1131,13 @@ class Node:
             (COAP_OPTION_URI_PATH, b"temperature"),     # resource /temperature
             (COAP_OPTION_CONTENT_FORMAT, b""),          # 0 = text/plain (0 is sent as empty value)
         ]
+        # Part C uses plain CoAP on port 5683; Part D uses CoAP over DTLS
+        # ("coaps") on port 5684
+        server_port = COAPS_SERVER_PORT if secure else COAP_SERVER_PORT
         self.send_coap(
-            server_ipv6, COAP_CLIENT_PORT, COAP_SERVER_PORT,
+            server_ipv6, COAP_CLIENT_PORT, server_port,
             COAP_CON, COAP_POST, message_id, token,
-            options, str(temperature).encode()
+            options, str(temperature).encode(), secure=secure
         )
 
 
@@ -799,7 +1150,8 @@ class Server(Node):
     def __init__(self, mac_address, ipv6_address):
         super().__init__("Server", mac_address, ipv6_address)
         self.label = "Server"
-        self.udp_listening_ports = {COAP_SERVER_PORT}
+        # 5683 = plain CoAP (Part C), 5684 = CoAP over DTLS (Part D)
+        self.udp_listening_ports = {COAP_SERVER_PORT, COAPS_SERVER_PORT}
         self.resources = {"temperature": []}    # stored sensor readings
 
     def route_ipv6(self, packet, destination_ipv6):
@@ -810,7 +1162,7 @@ class Server(Node):
         )
         self.send_wired(packet)
 
-    def handle_coap_request(self, coap, source_ipv6, source_port):
+    def handle_coap_request(self, coap, source_ipv6, source_port, secure=False):
         uri_path = "/".join(
             value.decode() for number, value in coap["options"]
             if number == COAP_OPTION_URI_PATH
@@ -839,10 +1191,13 @@ class Server(Node):
             f"[{self.label}][CoAP] Sending piggybacked ACK response "
             f"(same Message ID=0x{coap['message_id']:04x}, same Token=0x{coap['token'].hex()})"
         )
+        # A request that arrived over DTLS + ESP is answered the same way,
+        # so the response is protected too
+        server_port = COAPS_SERVER_PORT if secure else COAP_SERVER_PORT
         self.send_coap(
-            source_ipv6, COAP_SERVER_PORT, source_port,
+            source_ipv6, server_port, source_port,
             COAP_ACK, response_code, coap["message_id"], coap["token"],
-            [], response_payload
+            [], response_payload, secure=secure
         )
 
 
@@ -976,6 +1331,41 @@ def run_part_c(source, server):
     source.send_sensor_data(server.ipv6_address)
     print(f"\nServer has stored readings: {server.resources['temperature']}")
 
+def run_part_d(source, server, gateway):
+    print(f"\nPART D: CoAP secured with DTLS and IPsec ESP from Node {source.name} to Server")
+    print("Keys are preconfigured, the IPsec SA (SPI=0x00000001) is established and")
+    print("the DTLS handshake is complete. Encapsulation order at the sender:")
+    print("  MAC -> IPv6 (Next Header=50) -> IPsec ESP -> UDP -> DTLS -> CoAP\n")
+
+    source.send_sensor_data(server.ipv6_address, secure=True)
+    print(f"\nServer has stored readings: {server.resources['temperature']}")
+
+    run_security_tests(server, gateway)
+
+def run_security_tests(server, gateway):
+    """
+    Act as an attacker on the wired link between A and the server, who
+    captured the ESP-protected request that A just forwarded.
+    """
+    captured = gateway.last_wired_packet
+    if captured is None:
+        return
+    frame_from_gateway = {"source_mac": gateway.mac_address}
+
+    # Test 1: tampering. Flip one bit of the first ESP ciphertext byte.
+    # Without the HMAC key the attacker cannot produce a matching HMAC
+    print("\n--- Security test 1: attacker modifies one ciphertext byte ---\n")
+    tampered = bytearray(captured)
+    tampered[IPV6_HEADER_LEN + ESP_HEADER_LEN + IV_LEN] ^= 0x01
+    server.receive_wired({**frame_from_gateway, "payload": bytes(tampered)})
+
+    # Test 2: replay. Resend the captured packet unchanged. Its HMAC is
+    # valid, but its ESP sequence number has already been accepted
+    print("\n--- Security test 2: attacker replays the captured packet ---\n")
+    server.receive_wired({**frame_from_gateway, "payload": captured})
+
+    print(f"\nServer's stored readings are unchanged: {server.resources['temperature']}")
+
 def run_user_menu(nodes, server):
     while True:
         try:
@@ -996,7 +1386,7 @@ def run_user_menu(nodes, server):
         if part == "C":
             run_part_c(nodes[source_name], server)
         else:
-            print("Part D is not implemented yet")
+            run_part_d(nodes[source_name], server, nodes["A"])
 
 def main():
     nodes, server = create_network()
