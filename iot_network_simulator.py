@@ -77,31 +77,14 @@ COAP_ACK = 2    # Acknowledgement
 COAP_RST = 3    # Reset
 COAP_TYPE_NAME = {0: "CON", 1: "NON", 2: "ACK", 3: "RST"}
 
-# Codes are 8 bits written as c.dd: 3-bit class, 5-bit detail,
-# so code c.dd is stored as (c << 5) | dd.
+# Codes are 8 bits written as c.dd: 3-bit class, 5-bit detail.
 # Class 0 = request method, class 2 = success, class 4 = client error
-
-# Request methods (class 0)
-COAP_GET = 0x01             # 0.01 GET    - read a resource
-COAP_POST = 0x02            # 0.02 POST   - add to a resource (not idempotent)
-COAP_PUT = 0x03             # 0.03 PUT    - replace a resource (idempotent)
-COAP_DELETE = 0x04          # 0.04 DELETE - remove a resource (idempotent)
-COAP_METHODS = {"GET": COAP_GET, "POST": COAP_POST, "PUT": COAP_PUT, "DELETE": COAP_DELETE}
-
-# Response codes
-COAP_CREATED = 0x41         # 2.01 Created  (2 << 5 | 1)
-COAP_DELETED = 0x42         # 2.02 Deleted  (2 << 5 | 2)
+COAP_POST = 0x02            # 0.02 POST
 COAP_CHANGED = 0x44         # 2.04 Changed  (2 << 5 | 4)
-COAP_CONTENT = 0x45         # 2.05 Content  (2 << 5 | 5)
-COAP_BAD_REQUEST = 0x80     # 4.00 Bad Request (4 << 5 | 0)
-COAP_NOT_FOUND = 0x84       # 4.04 Not Found   (4 << 5 | 4)
-COAP_METHOD_NOT_ALLOWED = 0x85  # 4.05 Method Not Allowed (4 << 5 | 5)
-
+COAP_NOT_FOUND = 0x84       # 4.04 Not Found (4 << 5 | 4)
 COAP_CODE_NAME = {
     0x01: "GET", 0x02: "POST", 0x03: "PUT", 0x04: "DELETE",
-    0x41: "2.01 Created", 0x42: "2.02 Deleted", 0x44: "2.04 Changed",
-    0x45: "2.05 Content", 0x80: "4.00 Bad Request", 0x84: "4.04 Not Found",
-    0x85: "4.05 Method Not Allowed",
+    0x44: "2.04 Changed", 0x45: "2.05 Content", 0x84: "4.04 Not Found",
 }
 
 # Option numbers
@@ -784,11 +767,11 @@ class Node:
         self.coap_message_id = (self.coap_message_id + 1) % 0x10000
         return message_id
 
-    def send_coap_request(self, server_ipv6, method, resource, payload=b""):
-        """
-        Client side of CoAP: send a Confirmable request with any method
-        (GET, POST, PUT or DELETE) to /<resource> on the server.
-        """
+    def send_sensor_data(self, server_ipv6):
+        """Application: read a temperature and POST it to the CoAP server."""
+        temperature = round(random.uniform(18.0, 30.0), 1)
+        print(f"[{self.label}][App] Generated sensor reading: Temperature={temperature}°C")
+
         # Message ID: 16-bit, detects duplicates and pairs the ACK with this CON.
         # Token: random bytes chosen by the client that pair the response with
         # this request (and make responses harder to spoof)
@@ -796,37 +779,15 @@ class Node:
         token = os.urandom(4)
         self.pending_requests[message_id] = token
 
-        options = [(COAP_OPTION_URI_PATH, resource.encode())]   # e.g. /temperature
-        if payload:
-            # Content-Format 0 = text/plain; the value 0 is sent as an empty option
-            options.append((COAP_OPTION_CONTENT_FORMAT, b""))
-
+        options = [
+            (COAP_OPTION_URI_PATH, b"temperature"),     # resource /temperature
+            (COAP_OPTION_CONTENT_FORMAT, b""),          # 0 = text/plain (0 is sent as empty value)
+        ]
         self.send_coap(
             server_ipv6, COAP_CLIENT_PORT, COAP_SERVER_PORT,
-            COAP_CON, method, message_id, token,
-            options, payload
+            COAP_CON, COAP_POST, message_id, token,
+            options, str(temperature).encode()
         )
-
-    def read_temperature(self):
-        """Simulated sensor: returns a temperature in °C."""
-        temperature = round(random.uniform(18.0, 30.0), 1)
-        print(f"[{self.label}][App] Generated sensor reading: Temperature={temperature}°C")
-        return temperature
-
-    def run_coap_client(self, server_ipv6, method_name):
-        """Application: perform one CoAP operation on /temperature."""
-        print(f"[{self.label}][App] CoAP operation: {method_name} /temperature")
-        if method_name in ("POST", "PUT"):
-            # POST adds a new reading, PUT replaces this node's readings
-            payload = str(self.read_temperature()).encode()
-        else:
-            # GET and DELETE only name the resource, they carry no payload
-            payload = b""
-        self.send_coap_request(server_ipv6, COAP_METHODS[method_name], "temperature", payload)
-
-    def send_sensor_data(self, server_ipv6):
-        """Part C requirement: POST a temperature reading to the CoAP server."""
-        self.run_coap_client(server_ipv6, "POST")
 
 
 class Server(Node):
@@ -839,9 +800,7 @@ class Server(Node):
         super().__init__("Server", mac_address, ipv6_address)
         self.label = "Server"
         self.udp_listening_ports = {COAP_SERVER_PORT}
-        # Stored sensor readings, kept per client:
-        #   {resource name: {client IPv6 address: [reading, reading, ...]}}
-        self.resources = {"temperature": {}}
+        self.resources = {"temperature": []}    # stored sensor readings
 
     def route_ipv6(self, packet, destination_ipv6):
         # Everything the server sends goes to the gateway, root A
@@ -857,12 +816,19 @@ class Server(Node):
             if number == COAP_OPTION_URI_PATH
         )
 
-        response_code, response_payload = self.process_request(
-            coap["code"], uri_path, coap["payload"].decode(), source_ipv6
-        )
-
-        # A response with a payload says what format it is in (0 = text/plain)
-        response_options = [(COAP_OPTION_CONTENT_FORMAT, b"")] if response_payload else []
+        if coap["code"] == COAP_POST and uri_path in self.resources:
+            value = coap["payload"].decode()
+            self.resources[uri_path].append((source_ipv6, value))
+            print(
+                f"[{self.label}][CoAP] POST /{uri_path}: stored Temperature={value}°C "
+                f"from {source_ipv6}"
+            )
+            response_code = COAP_CHANGED
+            response_payload = f"Stored {value}C".encode()
+        else:
+            print(f"[{self.label}][CoAP] Resource /{uri_path} not found")
+            response_code = COAP_NOT_FOUND
+            response_payload = b"Not Found"
 
         if coap["type"] != COAP_CON:
             return  # a NON request gets no ACK
@@ -876,65 +842,8 @@ class Server(Node):
         self.send_coap(
             source_ipv6, COAP_SERVER_PORT, source_port,
             COAP_ACK, response_code, coap["message_id"], coap["token"],
-            response_options, response_payload
+            [], response_payload
         )
-
-    def process_request(self, method, uri_path, value, client_ipv6):
-        """
-        Apply a CoAP method to a resource and return (response code, payload).
-          GET    -> read the latest reading of every client        -> 2.05 Content
-          POST   -> append a new reading for this client           -> 2.04 Changed
-          PUT    -> replace this client's readings with one value  -> 2.01 Created / 2.04 Changed
-          DELETE -> remove this client's readings                  -> 2.02 Deleted
-        """
-        method_name = format_coap_code(method)
-        if uri_path not in self.resources:
-            print(f"[{self.label}][CoAP] {method_name} /{uri_path}: resource not found")
-            return COAP_NOT_FOUND, b"Not Found"
-
-        readings = self.resources[uri_path]     # {client IPv6: [values]}
-
-        if method == COAP_GET:
-            latest = [f"{client}={values[-1]}C" for client, values in readings.items()]
-            summary = "; ".join(latest) if latest else "No readings"
-            print(f"[{self.label}][CoAP] GET /{uri_path}: returning {summary}")
-            return COAP_CONTENT, summary.encode()
-
-        if method in (COAP_POST, COAP_PUT) and not value:
-            print(f"[{self.label}][CoAP] {method_name} /{uri_path}: missing payload")
-            return COAP_BAD_REQUEST, b"Missing payload"
-
-        if method == COAP_POST:
-            # POST is not idempotent: sending it twice stores two readings
-            readings.setdefault(client_ipv6, []).append(value)
-            print(
-                f"[{self.label}][CoAP] POST /{uri_path}: stored Temperature={value}°C "
-                f"from {client_ipv6}"
-            )
-            return COAP_CHANGED, f"Stored {value}C".encode()
-
-        if method == COAP_PUT:
-            # PUT is idempotent: sending it twice leaves the same single value
-            existed = client_ipv6 in readings
-            readings[client_ipv6] = [value]
-            print(
-                f"[{self.label}][CoAP] PUT /{uri_path}: set Temperature={value}°C "
-                f"for {client_ipv6} ({'replaced' if existed else 'created'})"
-            )
-            code = COAP_CHANGED if existed else COAP_CREATED
-            return code, f"Set {value}C".encode()
-
-        if method == COAP_DELETE:
-            # Only the requesting client's readings are removed
-            removed = len(readings.pop(client_ipv6, []))
-            print(
-                f"[{self.label}][CoAP] DELETE /{uri_path}: removed {removed} "
-                f"reading(s) from {client_ipv6}"
-            )
-            return COAP_DELETED, f"Deleted {removed} reading(s)".encode()
-
-        print(f"[{self.label}][CoAP] {method_name} not allowed on /{uri_path}")
-        return COAP_METHOD_NOT_ALLOWED, b"Method Not Allowed"
 
 
 def create_network():
@@ -1062,10 +971,10 @@ def build_rpl_topology(nodes):
         parent = node.preferred_parent.name if node.preferred_parent else "None (root)"
         print(f"  Node {node.name}: Rank={format_rank(node.rank)}, Preferred Parent={parent}")
 
-def run_part_c(source, server, method_name="POST"):
-    print(f"\nPART C: CoAP {method_name} over UDP from Node {source.name} to Server\n")
-    source.run_coap_client(server.ipv6_address, method_name)
-    print(f"\nServer's stored readings: {server.resources['temperature']}")
+def run_part_c(source, server):
+    print(f"\nPART C: CoAP over UDP from Node {source.name} to Server\n")
+    source.send_sensor_data(server.ipv6_address)
+    print(f"\nServer has stored readings: {server.resources['temperature']}")
 
 def run_user_menu(nodes, server):
     while True:
@@ -1081,19 +990,11 @@ def run_user_menu(nodes, server):
             if source_name not in nodes:
                 print("Please enter one of A, B, C, D or E")
                 continue
-
-            # POST is the operation the project requires, so it is the default
-            method_name = input(
-                "Select CoAP method (POST, PUT, GET or DELETE) [POST]: "
-            ).strip().upper() or "POST"
-            if method_name not in COAP_METHODS:
-                print("Please enter POST, PUT, GET or DELETE")
-                continue
         except EOFError:
             return
 
         if part == "C":
-            run_part_c(nodes[source_name], server, method_name)
+            run_part_c(nodes[source_name], server)
         else:
             print("Part D is not implemented yet")
 
